@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,11 +35,22 @@ type LoadTester struct {
 
 // NewLoadTester creates a new load tester
 func NewLoadTester(cacheURL, appURL string) *LoadTester {
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+	}
+
 	return &LoadTester{
 		CacheURL: cacheURL,
 		AppURL:   appURL,
-		Client:   &http.Client{Timeout: 10 * time.Second},
-		Results:  make([]TestResult, 0),
+		Client: &http.Client{
+			Transport: transport,
+			Timeout:   10 * time.Second,
+		},
+		Results: make([]TestResult, 0),
 	}
 }
 
@@ -217,6 +230,7 @@ func (lt *LoadTester) setCacheValue(key string, value interface{}, ttl int, tags
 
 	if resp != nil {
 		result.StatusCode = resp.StatusCode
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 
@@ -236,6 +250,7 @@ func (lt *LoadTester) getCacheValue(key string) TestResult {
 
 	if resp != nil {
 		result.StatusCode = resp.StatusCode
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 
@@ -322,9 +337,10 @@ func (lt *LoadTester) addResult(result TestResult) {
 func (lt *LoadTester) printResults(testName string, totalDuration time.Duration, totalRequests int) {
 	lt.mutex.Lock()
 	defer lt.mutex.Unlock()
+
 	str := strings.Repeat("=", 60)
-	fmt.Printf("\n %v \n", str)
-	fmt.Printf(" %s Results\n", testName)
+	fmt.Printf("\n%v\n", str)
+	fmt.Printf("📊 %s Results\n", testName)
 	fmt.Printf("%v\n", str)
 
 	if len(lt.Results) == 0 {
@@ -336,8 +352,10 @@ func (lt *LoadTester) printResults(testName string, totalDuration time.Duration,
 	var totalTime time.Duration
 	var successCount, errorCount int
 	var cacheHits, cacheMisses int
+
 	statusCodes := make(map[int]int)
 	requestTypes := make(map[string]int)
+	errorMessages := make(map[string]int)
 
 	var minDuration, maxDuration time.Duration
 	durations := make([]time.Duration, 0, len(lt.Results))
@@ -354,19 +372,26 @@ func (lt *LoadTester) printResults(testName string, totalDuration time.Duration,
 		if result.Duration < minDuration {
 			minDuration = result.Duration
 		}
+
 		if result.Duration > maxDuration {
 			maxDuration = result.Duration
 		}
 
+		// Success / error tracking
 		if result.Error == nil {
 			successCount++
 		} else {
 			errorCount++
+			errorMessages[result.Error.Error()]++
 		}
 
+		// Status code tracking
 		statusCodes[result.StatusCode]++
+
+		// Request type tracking
 		requestTypes[result.RequestType]++
 
+		// Cache status tracking
 		if result.CacheStatus == "HIT" {
 			cacheHits++
 		} else if result.CacheStatus == "MISS" {
@@ -374,28 +399,53 @@ func (lt *LoadTester) printResults(testName string, totalDuration time.Duration,
 		}
 	}
 
+	// Average latency
 	avgDuration := totalTime / time.Duration(len(lt.Results))
+
+	// Throughput
 	rps := float64(totalRequests) / totalDuration.Seconds()
 
-	// Print summary
+	// Summary
 	fmt.Printf("Total Duration:    %v\n", totalDuration)
 	fmt.Printf("Total Requests:    %d\n", totalRequests)
 	fmt.Printf("Requests/Second:   %.2f\n", rps)
-	fmt.Printf("Success Rate:      %.2f%% (%d/%d)\n", float64(successCount)/float64(len(lt.Results))*100, successCount, len(lt.Results))
-	fmt.Printf("Error Rate:        %.2f%% (%d/%d)\n", float64(errorCount)/float64(len(lt.Results))*100, errorCount, len(lt.Results))
 
+	fmt.Printf(
+		"Success Rate:      %.2f%% (%d/%d)\n",
+		float64(successCount)/float64(len(lt.Results))*100,
+		successCount,
+		len(lt.Results),
+	)
+
+	fmt.Printf(
+		"Error Rate:        %.2f%% (%d/%d)\n",
+		float64(errorCount)/float64(len(lt.Results))*100,
+		errorCount,
+		len(lt.Results),
+	)
+
+	// Cache hit rate
 	if cacheHits+cacheMisses > 0 {
-		fmt.Printf("Cache Hit Rate:    %.2f%% (%d/%d)\n", float64(cacheHits)/float64(cacheHits+cacheMisses)*100, cacheHits, cacheHits+cacheMisses)
+		fmt.Printf(
+			"Cache Hit Rate:    %.2f%% (%d/%d)\n",
+			float64(cacheHits)/float64(cacheHits+cacheMisses)*100,
+			cacheHits,
+			cacheHits+cacheMisses,
+		)
 	}
 
+	// Response times
 	fmt.Printf("\nResponse Times:\n")
 	fmt.Printf("  Min:             %v\n", minDuration)
 	fmt.Printf("  Max:             %v\n", maxDuration)
 	fmt.Printf("  Average:         %v\n", avgDuration)
 
-	// Calculate percentiles
+	// Sort durations before calculating percentiles
 	if len(durations) > 0 {
-		// Simple percentile calculation (not perfectly accurate but good enough)
+		sort.Slice(durations, func(i, j int) bool {
+			return durations[i] < durations[j]
+		})
+
 		p50 := durations[len(durations)*50/100]
 		p95 := durations[len(durations)*95/100]
 		p99 := durations[len(durations)*99/100]
@@ -405,14 +455,37 @@ func (lt *LoadTester) printResults(testName string, totalDuration time.Duration,
 		fmt.Printf("  99th percentile: %v\n", p99)
 	}
 
+	// Status code distribution
 	fmt.Printf("\nStatus Code Distribution:\n")
+
 	for code, count := range statusCodes {
-		fmt.Printf("  %d: %d (%.1f%%)\n", code, count, float64(count)/float64(len(lt.Results))*100)
+		fmt.Printf(
+			"  %d: %d (%.1f%%)\n",
+			code,
+			count,
+			float64(count)/float64(len(lt.Results))*100,
+		)
 	}
 
+	// Error distribution
+	if len(errorMessages) > 0 {
+		fmt.Printf("\nError Distribution:\n")
+
+		for err, count := range errorMessages {
+			fmt.Printf("  %d: %s\n", count, err)
+		}
+	}
+
+	// Request type distribution
 	fmt.Printf("\nRequest Type Distribution:\n")
+
 	for reqType, count := range requestTypes {
-		fmt.Printf("  %s: %d (%.1f%%)\n", reqType, count, float64(count)/float64(len(lt.Results))*100)
+		fmt.Printf(
+			"  %s: %d (%.1f%%)\n",
+			reqType,
+			count,
+			float64(count)/float64(len(lt.Results))*100,
+		)
 	}
 
 	// Clear results for next test
